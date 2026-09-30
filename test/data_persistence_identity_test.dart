@@ -95,5 +95,50 @@ void main() {
       );
       expect(rotated[1].virtualIPv4, '10.10.10.10');
     });
+
+    test('旋转不应覆盖用户自定义的设备ID', () {
+      final configs = [
+        _buildConfig(
+          itemKey: 'cfg-1',
+          configName: '主配置',
+          deviceId: 'legacy-unique-id',
+        ),
+        _buildConfig(
+          itemKey: 'cfg-2',
+          configName: '自定义配置',
+          deviceId: 'my-device-01',
+          virtualIp: '10.10.10.10',
+        ),
+      ];
+
+      final rotated = DataPersistence.rebuildNetworkConfigsWithUniqueId(
+        configs,
+        'next-device-id',
+        previousUniqueId: 'legacy-unique-id',
+      );
+
+      // 仍等于上一个安装级身份的被替换，自定义值原样保留
+      expect(rotated[0].deviceID, 'next-device-id');
+      expect(rotated[1].deviceID, 'my-device-01');
+      expect(rotated[1].virtualIPv4, '10.10.10.10');
+    });
+
+    test('空设备ID在旋转时也会被填充', () {
+      final configs = [
+        _buildConfig(
+          itemKey: 'cfg-1',
+          configName: '主配置',
+          deviceId: '',
+        ),
+      ];
+
+      final rotated = DataPersistence.rebuildNetworkConfigsWithUniqueId(
+        configs,
+        'next-device-id',
+        previousUniqueId: 'legacy-unique-id',
+      );
+
+      expect(rotated[0].deviceID, 'next-device-id');
+    });
   });
 }

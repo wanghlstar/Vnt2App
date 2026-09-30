@@ -35,7 +35,7 @@ class _NetworkConfigInputPageState extends State<NetworkConfigInputPage> {
   final _outIps = <TextEditingController>[];
   final _portMappings = <TextEditingController>[];
   final _groupPasswordController = TextEditingController();
-  final _deviceIDController = TextEditingController(); // 不可编辑
+  final _deviceIDController = TextEditingController(); // 设备身份标识，可自定义
   final _virtualNetworkCardNameController = TextEditingController();
   final _mtuController = TextEditingController();
   final _certModeController = TextEditingController(text: 'skip');
@@ -149,8 +149,15 @@ class _NetworkConfigInputPageState extends State<NetworkConfigInputPage> {
 
   Future<void> getDeviceUniqueId() async {
     String uniqueId = await DataPersistence().loadUniqueId();
+    if (!mounted) {
+      return;
+    }
     setState(() {
-      _deviceIDController.text = uniqueId;
+      // 仅在没有值（新建配置）时预填安装级唯一身份；
+      // 已加载配置携带自定义设备ID时不得覆盖
+      if (_deviceIDController.text.trim().isEmpty) {
+        _deviceIDController.text = uniqueId;
+      }
     });
   }
 
@@ -207,7 +214,7 @@ class _NetworkConfigInputPageState extends State<NetworkConfigInputPage> {
             .toList(),
         portMappings: portMappings,
         groupPassword: _groupPasswordController.text,
-        deviceID: _deviceIDController.text,
+        deviceID: _deviceIDController.text.trim(),
         virtualNetworkCardName: _virtualNetworkCardNameController.text,
         certMode: _certModeController.text.trim().isEmpty
             ? 'skip'
@@ -389,6 +396,26 @@ class _NetworkConfigInputPageState extends State<NetworkConfigInputPage> {
                     return null;
                   },
                 ),
+                _buildTextFormField(
+                  _deviceIDController,
+                  '设备ID',
+                  64,
+                  (value) {
+                    final text = value?.trim() ?? '';
+                    if (text.isEmpty) {
+                      return null;
+                    }
+                    if (text.length > 64) {
+                      return '设备ID长度不能超过64个字符';
+                    }
+                    return null;
+                  },
+                  null,
+                  true,
+                  false,
+                  null,
+                  '设备在组网中的唯一标识，可自定义；留空则自动生成',
+                ),
                 CustomTooltipTextField(
                   controller: _virtualIPv4Controller,
                   labelText: '虚拟IPv4',
@@ -486,15 +513,6 @@ class _NetworkConfigInputPageState extends State<NetworkConfigInputPage> {
                   visible: _isMoreParametersVisible,
                   child: Column(
                     children: [
-                      _buildTextFormField(
-                        _deviceIDController,
-                        '设备ID',
-                        null,
-                        null,
-                        null,
-                        false,
-                      ),
-                      const SizedBox(height: 16),
                       _buildTextFormField(
                         _virtualNetworkCardNameController,
                         '虚拟网卡名称',

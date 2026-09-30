@@ -29,6 +29,13 @@ public class MyVpnService extends VpnService {
     @Override
     public synchronized int onStartCommand(Intent intent, int flags, int startId) {
         vpnService = this;
+        // 系统重启（START_STICKY/始终连接的VPN）会以 null intent 拉起服务，
+        // 冷启动进程内 pendingConfig 也为 null，此时直接退出，避免 NPE 崩溃
+        if (intent == null || pendingConfig == null) {
+            Log.w(TAG, "onStartCommand without valid config, stopping service");
+            stopSelf();
+            return START_NOT_STICKY;
+        }
         new Thread(() -> {
             try {
                 int fd = startVpn(pendingConfig);
@@ -38,12 +45,12 @@ public class MyVpnService extends VpnService {
                 FlutterMethodChannel.callError("检测到其他 VPN 正在运行，请先断开其他 VPN 后重试", e);
                 stopSelf();
             } catch (Exception e) {
-                Log.e(TAG, "Failed to start VPN: " + pendingConfig.toString(), e);
+                Log.e(TAG, "Failed to start VPN", e);
                 FlutterMethodChannel.callError("启动 VPN 失败: " + e.getMessage(), e);
                 stopSelf();
             }
         }).start();
-        return START_STICKY;
+        return START_NOT_STICKY;
     }
 
     @Override

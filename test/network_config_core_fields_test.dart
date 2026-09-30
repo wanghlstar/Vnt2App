@@ -65,5 +65,37 @@ void main() {
     expect(config.normalizedProtocol, 'DYNAMIC');
     expect(config.v2CompatibleServerList, ['dynamic://edge.example.com']);
     expect(config.effectiveCertMode, 'skip');
+    expect(config.deviceID, 'device-2');
+    expect(config.toJson()['device_id'], 'device-2');
+  });
+
+  test('自定义 device_id 在序列化 round-trip 中保持', () {
+    final config = NetworkConfig.fromJson({
+      'itemKey': 'core-3',
+      'config_name': '自定义设备ID',
+      'network_code': 'game',
+      'device_name': 'desktop-node',
+      'device_id': 'my-device-01',
+      'server': ['quic://127.0.0.1:2222'],
+      'mtu': 1410,
+    });
+
+    expect(config.deviceID, 'my-device-01');
+    expect(config.toJson()['device_id'], 'my-device-01');
+    // 空设备ID时不写入 device_id 键，由核心自动生成
+    expect(config.toJsonSimple().containsKey('device_id'), isTrue);
+
+    final empty = NetworkConfig.fromJson({
+      'itemKey': 'core-4',
+      'config_name': '自动设备ID',
+      'network_code': 'game',
+      'device_name': 'desktop-node',
+      'device_id': '',
+      'server': ['quic://127.0.0.1:2222'],
+      'mtu': 1410,
+    });
+
+    expect(empty.deviceID, '');
+    expect(empty.toJsonSimple().containsKey('device_id'), isFalse);
   });
 }

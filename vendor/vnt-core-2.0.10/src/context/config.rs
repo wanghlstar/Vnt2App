@@ -1,0 +1,1313 @@
+use crate::crypto::PacketCrypto;
+use crate::nat::{NetInput, SubnetMapping};
+use crate::port_mapping::PortMapping;
+use crate::tls::verifier::CertValidationMode;
+use crate::tunnel_core::server::transport::config::{ConnectRegConfig, ProtocolAddress};
+use crate::utils::atomic64::AtomicU64;
+use anyhow::{anyhow, bail};
+use ipnet::Ipv4Net;
+use rustp2p_core::punch::{PunchPolicy, PunchPolicySet};
+use rustp2p_core::route_table::Protocol;
+use rustp2p_core::socket::LocalInterface;
+use std::collections::HashSet;
+use std::fmt::{Display, Formatter};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
+use std::sync::{
+    Arc,
+    atomic::Ordering,
+};
+
+pub const MAX_NETWORK_CODE_LEN: usize = 32;
+pub const MAX_DEVICE_ID_LEN: usize = 64;
+pub const MAX_NAME_LEN: usize = 128;
+pub const MAX_VERSION_LEN: usize = 32;
+pub const MAX_MTU: u16 = 1500;
+
+/// A fixed overlay node address. Plain IPv4 values keep the historical
+/// configuration shape and use /24 when no prefix is provided.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct VirtualIp {
+    ip: Ipv4Addr,
+    prefix_len: u8,
+}
+
+impl VirtualIp {
+    pub fn new(ip: Ipv4Addr, prefix_len: u8) -> anyhow::Result<Self> {
+        let net = Ipv4Net::new(ip, prefix_len)?;
+        if prefix_len > 30 {
+            bail!("virtual IP prefix must be between 0 and 30")
+        }
+        if ip == net.network() || ip == net.broadcast() {
+            bail!("virtual IP {ip}/{prefix_len} cannot be the network or broadcast address")
+        }
+        Ok(Self { ip, prefix_len })
+    }
+
+    pub fn ip(self) -> Ipv4Addr {
+        self.ip
+    }
+
+    pub fn prefix_len(self) -> u8 {
+        self.prefix_len
+    }
+
+    pub fn network(self) -> Ipv4Net {
+        Ipv4Net::new_assert(self.ip, self.prefix_len)
+    }
+}
+
+impl FromStr for VirtualIp {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        let (ip, prefix_len) = if let Some((ip, prefix)) = value.split_once('/') {
+            (
+                ip.parse::<Ipv4Addr>()
+                    .map_err(|error| anyhow::anyhow!("invalid virtual IP '{value}': {error}"))?,
+                prefix.parse::<u8>().map_err(|error| {
+                    anyhow::anyhow!("invalid virtual IP prefix '{value}': {error}")
+                })?,
+            )
+        } else {
+            (
+                value
+                    .parse::<Ipv4Addr>()
+                    .map_err(|error| anyhow::anyhow!("invalid virtual IP '{value}': {error}"))?,
+                24,
+            )
+        };
+        Self::new(ip, prefix_len)
+    }
+}
+
+impl Display for VirtualIp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.ip, self.prefix_len)
+    }
+}
+
+impl serde::Serialize for VirtualIp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VirtualIp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+const PUNCH_POLICIES: [PunchPolicy; 4] = [
+    PunchPolicy::IPv4Tcp,
+    PunchPolicy::IPv4Udp,
+    PunchPolicy::IPv6Tcp,
+    PunchPolicy::IPv6Udp,
+];
+
+#[derive(Debug, Clone)]
+pub struct PunchRule {
+    target: Ipv4Net,
+    policies: PunchPolicySet,
+}
+
+impl PartialEq for PunchRule {
+    fn eq(&self, other: &Self) -> bool {
+        self.target == other.target
+            && PUNCH_POLICIES
+                .iter()
+                .all(|policy| self.policies.is_match(*policy) == other.policies.is_match(*policy))
+    }
+}
+
+impl PunchRule {
+    pub fn target(&self) -> Ipv4Net {
+        self.target
+    }
+
+    pub fn policies(&self) -> PunchPolicySet {
+        self.policies.clone()
+    }
+
+    pub fn matches(&self, ip: &Ipv4Addr) -> bool {
+        self.target.contains(ip)
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for policy in PUNCH_POLICIES {
+            if other.policies.is_match(policy) {
+                self.policies.or(policy);
+            }
+        }
+    }
+}
+
+impl FromStr for PunchRule {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let parts = value.split(',').map(str::trim).collect::<Vec<_>>();
+        if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+            bail!("invalid punch model rule '{value}', expected target_ip_or_cidr,mode[,mode...]")
+        }
+        let target = if parts[0].contains('/') {
+            parts[0]
+                .parse::<Ipv4Net>()
+                .map_err(|error| anyhow::anyhow!("invalid punch target '{}': {error}", parts[0]))?
+        } else {
+            let ip = parts[0]
+                .parse::<Ipv4Addr>()
+                .map_err(|error| anyhow::anyhow!("invalid punch target '{}': {error}", parts[0]))?;
+            Ipv4Net::new(ip, 32)?
+        };
+        let mut policies = PunchPolicySet::empty();
+        for value in &parts[1..] {
+            policies.or(parse_punch_policy(value)?);
+        }
+        Ok(Self { target, policies })
+    }
+}
+
+impl Display for PunchRule {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.target.prefix_len() == 32 {
+            write!(f, "{}", self.target.addr())?;
+        } else {
+            write!(f, "{}", self.target)?;
+        }
+        for policy in PUNCH_POLICIES {
+            if self.policies.is_match(policy) {
+                write!(f, ",{}", punch_policy_name(policy))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_punch_policy(value: &str) -> anyhow::Result<PunchPolicy> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['-', '_'], "");
+    match normalized.as_str() {
+        "ipv4tcp" => Ok(PunchPolicy::IPv4Tcp),
+        "ipv4udp" => Ok(PunchPolicy::IPv4Udp),
+        "ipv6tcp" => Ok(PunchPolicy::IPv6Tcp),
+        "ipv6udp" => Ok(PunchPolicy::IPv6Udp),
+        _ => bail!(
+            "invalid punch mode '{value}', expected one of: IPv4Tcp, IPv4Udp, IPv6Tcp, IPv6Udp"
+        ),
+    }
+}
+
+fn punch_policy_name(policy: PunchPolicy) -> &'static str {
+    match policy {
+        PunchPolicy::IPv4Tcp => "IPv4Tcp",
+        PunchPolicy::IPv4Udp => "IPv4Udp",
+        PunchPolicy::IPv6Tcp => "IPv6Tcp",
+        PunchPolicy::IPv6Udp => "IPv6Udp",
+    }
+}
+
+pub fn punch_model_for(rules: &[PunchRule], target: &Ipv4Addr) -> PunchPolicySet {
+    rules
+        .iter()
+        .filter(|rule| rule.matches(target))
+        .max_by_key(|rule| rule.target.prefix_len())
+        .map(PunchRule::policies)
+        .unwrap_or_else(PunchPolicySet::all)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct TurnRule {
+    target: Ipv4Net,
+    turn_ip: Ipv4Addr,
+}
+
+impl TurnRule {
+    pub fn target(&self) -> Ipv4Net {
+        self.target
+    }
+
+    pub fn turn_ip(&self) -> Ipv4Addr {
+        self.turn_ip
+    }
+
+    pub fn matches(&self, ip: &Ipv4Addr) -> bool {
+        self.target.contains(ip)
+    }
+}
+
+impl FromStr for TurnRule {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let parts = value.split(',').map(str::trim).collect::<Vec<_>>();
+        if parts.len() != 2 {
+            bail!("invalid turn rule '{value}', expected target_ip_or_cidr,turn_ip")
+        }
+
+        let target = if parts[0].contains('/') {
+            parts[0]
+                .parse::<Ipv4Net>()
+                .map_err(|error| anyhow::anyhow!("invalid turn target '{}': {error}", parts[0]))?
+        } else {
+            let ip = parts[0]
+                .parse::<Ipv4Addr>()
+                .map_err(|error| anyhow::anyhow!("invalid turn target '{}': {error}", parts[0]))?;
+            Ipv4Net::new(ip, 32)?
+        };
+        let turn_ip = parts[1]
+            .parse::<Ipv4Addr>()
+            .map_err(|error| anyhow::anyhow!("invalid turn IP '{}': {error}", parts[1]))?;
+
+        Ok(Self { target, turn_ip })
+    }
+}
+
+impl Display for TurnRule {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.target.prefix_len() == 32 {
+            write!(f, "{},{}", self.target.addr(), self.turn_ip)
+        } else {
+            write!(f, "{},{}", self.target, self.turn_ip)
+        }
+    }
+}
+
+pub fn turn_ip_for(rules: &[TurnRule], target: &Ipv4Addr) -> Option<Ipv4Addr> {
+    rules
+        .iter()
+        .filter(|rule| rule.matches(target))
+        .max_by_key(|rule| rule.target.prefix_len())
+        .map(TurnRule::turn_ip)
+}
+
+pub fn is_turn_ip(rules: &[TurnRule], ip: &Ipv4Addr) -> bool {
+    rules.iter().any(|rule| rule.turn_ip == *ip)
+}
+
+/// A configured relay remains punchable even when it is covered by a target rule.
+pub fn allow_punch(rules: &[TurnRule], ip: &Ipv4Addr) -> bool {
+    is_turn_ip(rules, ip) || turn_ip_for(rules, ip).is_none()
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum PeerProtocol {
+    Both,
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct PeerAddress {
+    kind: PeerAddressKind,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+enum PeerAddressKind {
+    Static {
+        protocol: PeerProtocol,
+        /// host 为 IP 字面量或域名；IPv6 存储时不含方括号。
+        host: String,
+        port: u16,
+    },
+    /// `dynamic://` 后的 DNS 域名或 HTTP(S) 地址列表 URL。
+    Dynamic { source: String },
+}
+
+impl PeerAddress {
+    pub fn protocol(&self) -> PeerProtocol {
+        match &self.kind {
+            PeerAddressKind::Static { protocol, .. } => *protocol,
+            // 保持此公共方法的兼容性；动态地址实际协议由解析结果决定。
+            PeerAddressKind::Dynamic { .. } => PeerProtocol::Both,
+        }
+    }
+
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self.kind, PeerAddressKind::Dynamic { .. })
+    }
+
+    /// 解析动态地址列表。DNS TXT 或 HTTP(S) 响应的每个非空行均为一条普通
+    /// peer_address；无效条目仅告警，不影响同一列表中的其他地址。
+    pub async fn resolve_dynamic(
+        &self,
+        default_interface: &Option<LocalInterface>,
+    ) -> anyhow::Result<Vec<Self>> {
+        let PeerAddressKind::Dynamic { source } = &self.kind else {
+            return Ok(vec![self.clone()]);
+        };
+        let lower_source = source.to_ascii_lowercase();
+        let entries: Vec<String> =
+            if lower_source.starts_with("http://") || lower_source.starts_with("https://") {
+                crate::utils::http_get::http_get_text(source)
+                    .await?
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            } else {
+                crate::utils::dns_query::dns_query_txt(source, vec![], default_interface)
+                    .await?
+                    .into_iter()
+                    .flat_map(|entry| {
+                        entry
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            };
+
+        let mut peers = Vec::new();
+        for entry in entries {
+            match entry.parse::<PeerAddress>() {
+                Ok(peer) if !peer.is_dynamic() => peers.push(peer),
+                Ok(_) => log::warn!(
+                    "dynamic peer address {self} contains nested dynamic entry {entry:?}; skipping"
+                ),
+                Err(error) => log::warn!(
+                    "invalid dynamic peer address entry {entry:?} from {self}: {error}; skipping"
+                ),
+            }
+        }
+        if peers.is_empty() {
+            bail!("no valid peer addresses resolved for {self}")
+        }
+        Ok(peers)
+    }
+
+    /// 在使用时解析出实际地址：
+    /// - IP 字面量直接使用
+    /// - 域名通过 DNS 查询解析（A/AAAA），解析失败返回错误
+    pub(crate) async fn endpoints(
+        &self,
+        default_interface: &Option<LocalInterface>,
+    ) -> anyhow::Result<Vec<(Protocol, SocketAddr)>> {
+        let PeerAddressKind::Static {
+            protocol,
+            host,
+            port,
+        } = &self.kind
+        else {
+            bail!("dynamic peer address {self} must be resolved before probing")
+        };
+        let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+            vec![SocketAddr::new(ip, *port)]
+        } else {
+            crate::utils::dns_query::dns_query_all(host, &vec![], default_interface)
+                .await?
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, *port))
+                .collect::<Vec<_>>()
+        };
+        let mut endpoints = Vec::with_capacity(addrs.len() * 2);
+        for addr in addrs {
+            match protocol {
+                PeerProtocol::Both => {
+                    endpoints.push((Protocol::TCP, addr));
+                    endpoints.push((Protocol::UDP, addr));
+                }
+                PeerProtocol::Tcp => endpoints.push((Protocol::TCP, addr)),
+                PeerProtocol::Udp => endpoints.push((Protocol::UDP, addr)),
+            }
+        }
+        Ok(endpoints)
+    }
+}
+
+impl FromStr for PeerAddress {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        let lower = value.to_ascii_lowercase();
+        if lower.starts_with("dynamic://") {
+            let source = value[10..].trim();
+            if source.is_empty() {
+                bail!("dynamic peer address source must not be empty")
+            }
+            return Ok(Self {
+                kind: PeerAddressKind::Dynamic {
+                    source: source.to_owned(),
+                },
+            });
+        }
+        let (protocol, address) = if lower.starts_with("tcp://") {
+            (PeerProtocol::Tcp, &value[6..])
+        } else if lower.starts_with("udp://") {
+            (PeerProtocol::Udp, &value[6..])
+        } else if value.contains("://") {
+            bail!("invalid peer protocol in '{value}', expected tcp://, udp://, or dynamic://")
+        } else {
+            (PeerProtocol::Both, value)
+        };
+        let (host, port) = crate::utils::addr::split_host_port(address)
+            .map_err(|error| anyhow!("invalid peer address '{value}': {error}"))?;
+        if port == 0 {
+            bail!("invalid peer address '{value}': port must not be 0")
+        }
+        Ok(Self {
+            kind: PeerAddressKind::Static {
+                protocol,
+                host: host.to_string(),
+                port,
+            },
+        })
+    }
+}
+
+impl Display for PeerAddress {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            PeerAddressKind::Dynamic { source } => write!(f, "dynamic://{source}"),
+            PeerAddressKind::Static {
+                protocol,
+                host,
+                port,
+            } => {
+                let address = if host.contains(':') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                };
+                match protocol {
+                    PeerProtocol::Both => write!(f, "{address}"),
+                    PeerProtocol::Tcp => write!(f, "tcp://{address}"),
+                    PeerProtocol::Udp => write!(f, "udp://{address}"),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceMode {
+    No,
+    #[default]
+    Tun,
+    Tap,
+}
+
+impl DeviceMode {
+    pub fn has_device(self) -> bool {
+        !matches!(self, Self::No)
+    }
+}
+
+impl Display for DeviceMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::No => "no",
+            Self::Tun => "tun",
+            Self::Tap => "tap",
+        })
+    }
+}
+
+impl FromStr for DeviceMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "no" => Ok(Self::No),
+            "tun" => Ok(Self::Tun),
+            "tap" => Ok(Self::Tap),
+            _ => bail!("invalid device_mode '{value}', expected one of: no, tun, tap"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    pub server_addr: Vec<ProtocolAddress>,
+    pub peer_address: Vec<PeerAddress>,
+    pub turn: Vec<TurnRule>,
+    pub punch_model: Vec<PunchRule>,
+    pub cert_mode: CertValidationMode,
+    pub network_code: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub tun_name: Option<String>,
+    /// 绑定 VNT 对外通信 Socket 的物理网卡名称。
+    pub outbound_interface: Option<String>,
+    pub ip: Option<VirtualIp>,
+    pub password: Option<String>,
+    pub no_punch: bool,
+    pub no_broadcast: bool,
+    /// 允许与由服务端终结的 IKEv2/IPsec 客户端互通。
+    pub allow_ikev2: bool,
+    /// 允许与由服务端终结的 WireGuard 客户端互通。
+    pub allow_wireguard: bool,
+    pub compress: bool,
+    pub rtx: bool,
+    pub fec: bool,
+    pub input: Vec<NetInput>,
+    pub subnet_mapping: Vec<SubnetMapping>,
+    pub output: Vec<Ipv4Net>,
+    pub auto_sync_subnet: bool,
+    pub no_nat: bool,
+    pub device_mode: DeviceMode,
+    pub mtu: Option<u16>,
+    pub port_mapping: Vec<PortMapping>,
+    pub allow_port_mapping: bool,
+    pub udp_stun: Vec<String>,
+    pub tcp_stun: Vec<String>,
+    /// P2P 隧道监听地址；每个地址族最多一个地址，且必须使用同一端口。
+    pub tunnel_addr: Vec<SocketAddr>,
+    /// 旧版仅端口配置，保留用于兼容。
+    pub tunnel_port: Option<u16>,
+    /// 事件脚本路径/命令；网卡创建成功、掉线、重连成功、IP 变化时以参数方式调用
+    pub event_script: Option<String>,
+    /// Opaque server-management credential. Its Debug implementation is
+    /// deliberately redacted.
+    pub managed: Option<ManagedRegistration>,
+}
+
+#[derive(Clone)]
+pub struct ManagedRegistration {
+    credential_key: Vec<u8>,
+    pub network_code: String,
+    pub device_id: String,
+    pub instance_id: Vec<u8>,
+    revision: Arc<AtomicU64>,
+}
+
+impl PartialEq for ManagedRegistration {
+    fn eq(&self, other: &Self) -> bool {
+        // revision 是运行期回执状态而非配置，比较时刻意排除
+        self.credential_key == other.credential_key
+            && self.network_code == other.network_code
+            && self.device_id == other.device_id
+            && self.instance_id == other.instance_id
+    }
+}
+
+impl ManagedRegistration {
+    pub fn new(
+        credential_key: Vec<u8>,
+        network_code: String,
+        device_id: String,
+        instance_id: Vec<u8>,
+        revision: u64,
+    ) -> Self {
+        Self {
+            credential_key,
+            network_code,
+            device_id,
+            instance_id,
+            revision: Arc::new(AtomicU64::new(revision)),
+        }
+    }
+
+    pub(crate) fn create_registration(
+        &self,
+        _runtime_network_code: &str,
+        _runtime_device_id: &str,
+    ) -> crate::protocol::control_message::SubscriptionRegistration {
+        let client_nonce = crate::managed_config::random_nonce();
+        let client_proof = crate::managed_config::client_proof(&self.credential_key, &client_nonce);
+        crate::protocol::control_message::SubscriptionRegistration {
+            network_code: self.network_code.clone(),
+            device_id: self.device_id.clone(),
+            client_nonce,
+            client_proof,
+            instance_id: self.instance_id.clone(),
+            applied_revision: self.revision.load(Ordering::Acquire),
+        }
+    }
+
+    /// 已应用的服务端配置 revision（0 表示尚未应用）。
+    pub(crate) fn applied_revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn verify_server_proof(
+        &self,
+        registration: &crate::protocol::control_message::SubscriptionRegistration,
+        proof: &crate::protocol::control_message::SubscriptionServerProof,
+    ) -> bool {
+        crate::managed_config::verify_server_proof(
+            &self.credential_key,
+            &registration.client_nonce,
+            &proof.server_nonce,
+            &proof.server_proof,
+        )
+    }
+
+    pub(crate) fn mark_applied(&self, revision: u64) {
+        self.revision.fetch_max(revision, Ordering::AcqRel);
+    }
+}
+
+impl std::fmt::Debug for ManagedRegistration {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedRegistration")
+            .field("credential_key", &"[REDACTED]")
+            .field("network_code", &self.network_code)
+            .field("device_id", &self.device_id)
+            .field("instance_id", &"[REDACTED]")
+            .field("revision", &self.revision.load(Ordering::Acquire))
+            .finish()
+    }
+}
+impl Config {
+    /// 序列化为配置文件（TOML）文本，用于查看实例当前生效的配置。
+    ///
+    /// 只输出与默认值不同的字段（布尔项仅在为 true 时输出），身份字段
+    /// （network_code/device_id）始终输出；订阅托管时把已应用的 revision
+    /// 以注释形式标注在头部。键名与配置文件一致（如 server 对应
+    /// server_addr、allow_mapping 对应 allow_port_mapping）。
+    pub fn to_toml_string(&self) -> String {
+        let mut table = toml::Table::new();
+        table.insert("network_code".into(), self.network_code.clone().into());
+        table.insert("device_id".into(), self.device_id.clone().into());
+        if !self.device_name.is_empty() {
+            table.insert("device_name".into(), self.device_name.clone().into());
+        }
+        if !self.server_addr.is_empty() {
+            table.insert(
+                "server".into(),
+                toml_string_array(self.server_addr.iter().map(ToString::to_string)),
+            );
+        }
+        if let Some(ip) = &self.ip {
+            table.insert("ip".into(), ip.to_string().into());
+        }
+        insert_string_array(&mut table, "peer_address", &self.peer_address);
+        insert_string_array(&mut table, "turn", &self.turn);
+        insert_string_array(&mut table, "punch_model", &self.punch_model);
+        if self.cert_mode != CertValidationMode::default() {
+            table.insert("cert_mode".into(), self.cert_mode.to_string().into());
+        }
+        if let Some(password) = &self.password {
+            table.insert("password".into(), password.clone().into());
+        }
+        if let Some(outbound_interface) = &self.outbound_interface {
+            table.insert(
+                "outbound_interface".into(),
+                outbound_interface.clone().into(),
+            );
+        }
+        if let Some(tun_name) = &self.tun_name {
+            table.insert("tun_name".into(), tun_name.clone().into());
+        }
+        if self.device_mode != DeviceMode::default() {
+            table.insert("device_mode".into(), self.device_mode.to_string().into());
+        }
+        if let Some(mtu) = self.mtu {
+            table.insert("mtu".into(), i64::from(mtu).into());
+        }
+        if let Some(tunnel_port) = self.tunnel_port {
+            table.insert("tunnel_port".into(), i64::from(tunnel_port).into());
+        }
+        insert_string_array(&mut table, "tunnel_addr", &self.tunnel_addr);
+        insert_string_array(&mut table, "input", &self.input);
+        insert_string_array(&mut table, "subnet_mapping", &self.subnet_mapping);
+        insert_string_array(&mut table, "output", &self.output);
+        insert_string_array(&mut table, "port_mapping", &self.port_mapping);
+        insert_string_array(&mut table, "udp_stun", &self.udp_stun);
+        insert_string_array(&mut table, "tcp_stun", &self.tcp_stun);
+        for (key, value) in [
+            ("no_punch", self.no_punch),
+            ("no_broadcast", self.no_broadcast),
+            ("allow_ikev2", self.allow_ikev2),
+            ("allow_wireguard", self.allow_wireguard),
+            ("rtx", self.rtx),
+            ("compress", self.compress),
+            ("fec", self.fec),
+            ("auto_sync_subnet", self.auto_sync_subnet),
+            ("no_nat", self.no_nat),
+            // 配置文件里的键名是 allow_mapping
+            ("allow_mapping", self.allow_port_mapping),
+        ] {
+            if value {
+                table.insert(key.into(), value.into());
+            }
+        }
+        if let Some(event_script) = &self.event_script {
+            table.insert("event_script".into(), event_script.clone().into());
+        }
+        let mut text = toml::to_string(&table).unwrap_or_default();
+        let mut header = String::from(
+            "# 当前生效配置（本地配置与服务端下发合并后的结果）
+",
+        );
+        if let Some(managed) = &self.managed {
+            header.push_str(&format!(
+                "# 服务端管理: 已应用 revision {}
+",
+                managed.applied_revision()
+            ));
+        }
+        text.insert_str(0, &header);
+        text
+    }
+
+    pub fn normalize(&mut self) -> anyhow::Result<()> {
+        self.check_turn_rules()?;
+        self.check_tunnel_addr()?;
+        let mut seen = HashSet::new();
+        self.turn.retain(|rule| seen.insert(rule.clone()));
+        let mut merged = Vec::<PunchRule>::new();
+        for rule in self.punch_model.drain(..) {
+            if let Some(existing) = merged.iter_mut().find(|item| item.target == rule.target) {
+                existing.merge(&rule);
+            } else {
+                merged.push(rule);
+            }
+        }
+        self.punch_model = merged;
+        crate::nat::subnet_mapping::normalize_and_validate(&mut self.subnet_mapping, &self.output)?;
+        Ok(())
+    }
+
+    fn check_tunnel_addr(&self) -> anyhow::Result<()> {
+        if !self.tunnel_addr.is_empty() && self.tunnel_port.is_some() {
+            bail!("tunnel_addr and tunnel_port cannot be configured together")
+        }
+        let mut ipv4 = false;
+        let mut ipv6 = false;
+        let mut port = None;
+        for addr in &self.tunnel_addr {
+            let seen = match addr {
+                SocketAddr::V4(_) => &mut ipv4,
+                SocketAddr::V6(_) => &mut ipv6,
+            };
+            if *seen {
+                bail!("tunnel_addr supports at most one address per IP family")
+            }
+            *seen = true;
+            if let Some(expected) = port
+                && expected != addr.port()
+            {
+                bail!("all tunnel_addr entries must use the same port")
+            }
+            port = Some(addr.port());
+        }
+        Ok(())
+    }
+
+    fn check_turn_rules(&self) -> anyhow::Result<()> {
+        for (index, rule) in self.turn.iter().enumerate() {
+            if let Some(conflict) = self.turn[index + 1..]
+                .iter()
+                .find(|other| other.target == rule.target && other.turn_ip != rule.turn_ip)
+            {
+                bail!(
+                    "conflicting turn rules for {}: {} and {}",
+                    rule.target,
+                    rule.turn_ip,
+                    conflict.turn_ip
+                )
+            }
+        }
+        Ok(())
+    }
+
+    pub fn check(&self) -> anyhow::Result<()> {
+        self.check_tunnel_addr()?;
+        #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+        if self.device_mode == DeviceMode::Tap {
+            bail!("TAP mode is not supported on mobile VPN interfaces");
+        }
+        if self.server_addr.is_empty() && self.ip.is_none() {
+            bail!("未配置服务器时必须指定虚拟 IP");
+        }
+        if self.server_addr.len() > 1 {
+            let mut set = HashSet::new();
+
+            for a in self.server_addr.iter() {
+                if !set.insert(a.to_string()) {
+                    bail!("服务器地址不能相同")
+                }
+            }
+            if self.ip.is_none() {
+                bail!("配置多个服务器时必须指定虚拟 IP")
+            }
+        }
+        self.check_turn_rules()?;
+
+        if self.network_code.len() > MAX_NETWORK_CODE_LEN {
+            bail!(
+                "network_code length exceeds {} characters (current: {})",
+                MAX_NETWORK_CODE_LEN,
+                self.network_code.len()
+            )
+        }
+
+        if self.device_id.len() > MAX_DEVICE_ID_LEN {
+            bail!(
+                "device_id length exceeds {} characters (current: {})",
+                MAX_DEVICE_ID_LEN,
+                self.device_id.len()
+            )
+        }
+
+        if self.device_name.len() > MAX_NAME_LEN {
+            bail!(
+                "name length exceeds {} characters (current: {})",
+                MAX_NAME_LEN,
+                self.device_name.len()
+            )
+        }
+        if let Some(mtu) = self.mtu
+            && mtu > MAX_MTU
+        {
+            bail!("MTU is too large (Maximum mtu: {MAX_MTU})",)
+        }
+        Ok(())
+    }
+    pub fn key_sign(&self) -> Option<String> {
+        self.password.as_ref().map(|p| PacketCrypto::key_sign(p))
+    }
+    pub(crate) fn to_connect_config(
+        &self,
+        index: usize,
+        default_interface: Option<rustp2p_core::socket::LocalInterface>,
+        network: crate::context::SharedNetworkAddr,
+        identity: crate::protocol::client_message::SharedNodeIdentity,
+        client_instance_id: std::sync::Arc<Vec<u8>>,
+    ) -> ConnectRegConfig {
+        ConnectRegConfig {
+            server_addr: self.server_addr[index].clone(),
+            cert_mode: self.cert_mode.clone(),
+            network_code: self.network_code.clone(),
+            device_id: self.device_id.clone(),
+            identity,
+            ip: network,
+            key_sign: self.key_sign(),
+            ip_variable: self.ip.is_none(),
+            allow_ikev2: self.allow_ikev2,
+            allow_wireguard: self.allow_wireguard,
+            default_interface,
+            managed: self.managed.clone(),
+            client_instance_id,
+        }
+    }
+}
+
+/// 把实现了 Display 的集合序列化为 TOML 字符串数组。
+fn insert_string_array<T: std::fmt::Display>(table: &mut toml::Table, key: &str, values: &[T]) {
+    if values.is_empty() {
+        return;
+    }
+    table.insert(
+        key.into(),
+        toml::Value::Array(
+            values
+                .iter()
+                .map(|value| toml::Value::String(value.to_string()))
+                .collect(),
+        ),
+    );
+}
+
+fn toml_string_array<I: IntoIterator<Item = String>>(values: I) -> toml::Value {
+    toml::Value::Array(values.into_iter().map(toml::Value::String).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn spawn_http_server(response: String) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        address
+    }
+
+    #[test]
+    fn virtual_ip_accepts_cidr_and_defaults_to_24() {
+        let plain: VirtualIp = "10.26.0.2".parse().unwrap();
+        assert_eq!(plain.ip(), Ipv4Addr::new(10, 26, 0, 2));
+        assert_eq!(plain.prefix_len(), 24);
+        assert_eq!(plain.to_string(), "10.26.0.2/24");
+
+        let cidr: VirtualIp = "10.26.8.2/20".parse().unwrap();
+        assert_eq!(cidr.prefix_len(), 20);
+        assert!("10.26.0.0/24".parse::<VirtualIp>().is_err());
+        assert!("10.26.0.255/24".parse::<VirtualIp>().is_err());
+        assert!("10.26.0.2/31".parse::<VirtualIp>().is_err());
+    }
+
+    #[test]
+    fn managed_registration_reports_latest_locally_applied_revision() {
+        let managed = ManagedRegistration::new(
+            vec![7; 32],
+            "managed-network".into(),
+            "managed-device".into(),
+            vec![9; 32],
+            3,
+        );
+        assert_eq!(
+            managed
+                .create_registration("managed-network", "managed-device")
+                .applied_revision,
+            3
+        );
+
+        managed.mark_applied(5);
+        assert_eq!(
+            managed
+                .create_registration("managed-network", "managed-device")
+                .applied_revision,
+            5
+        );
+
+        // Late completion of an older update must never move registration
+        // backwards and trigger a stale server catch-up on reconnect.
+        managed.mark_applied(4);
+        assert_eq!(
+            managed
+                .create_registration("managed-network", "managed-device")
+                .applied_revision,
+            5
+        );
+    }
+
+    #[test]
+    fn serverless_requires_a_fixed_virtual_ip() {
+        assert!(Config::default().check().is_err());
+        let config = Config {
+            ip: Some("10.26.0.2/24".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(config.check().is_ok());
+    }
+
+    #[test]
+    fn device_mode_parse_and_display() {
+        for (text, mode) in [
+            ("no", DeviceMode::No),
+            ("tun", DeviceMode::Tun),
+            ("tap", DeviceMode::Tap),
+        ] {
+            assert_eq!(text.parse::<DeviceMode>().unwrap(), mode);
+            assert_eq!(mode.to_string(), text);
+        }
+        assert!("bridge".parse::<DeviceMode>().is_err());
+        assert_eq!(DeviceMode::default(), DeviceMode::Tun);
+    }
+
+    #[test]
+    fn tunnel_addr_validation_accepts_dual_stack_with_one_port() {
+        let mut config = Config {
+            tunnel_addr: vec![
+                "192.168.1.10:29873".parse().unwrap(),
+                "[2001:db8::10]:29873".parse().unwrap(),
+            ],
+            ..Default::default()
+        };
+        config.normalize().unwrap();
+    }
+
+    #[test]
+    fn tunnel_addr_validation_rejects_ambiguous_bindings() {
+        for addrs in [
+            vec![
+                "192.168.1.10:29873".parse().unwrap(),
+                "192.168.1.11:29873".parse().unwrap(),
+            ],
+            vec![
+                "192.168.1.10:29873".parse().unwrap(),
+                "[2001:db8::10]:29874".parse().unwrap(),
+            ],
+        ] {
+            let mut config = Config {
+                tunnel_addr: addrs,
+                ..Default::default()
+            };
+            assert!(config.normalize().is_err());
+        }
+
+        let mut config = Config {
+            tunnel_addr: vec!["192.168.1.10:29873".parse().unwrap()],
+            tunnel_port: Some(29873),
+            ..Default::default()
+        };
+        assert!(config.normalize().is_err());
+    }
+
+    #[test]
+    fn multiple_servers_require_a_fixed_virtual_ip() {
+        let first: ProtocolAddress = "quic://127.0.0.1:29872".parse().unwrap();
+        let second: ProtocolAddress = "tcp://127.0.0.1:29873".parse().unwrap();
+
+        assert!(Config::default().check().is_err());
+
+        let single = Config {
+            server_addr: vec![first.clone()],
+            ..Default::default()
+        };
+        assert!(single.check().is_ok());
+
+        let dynamic_ip = Config {
+            server_addr: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        let error = dynamic_ip.check().unwrap_err().to_string();
+        assert!(error.contains("多个服务器"));
+        assert!(error.contains("虚拟 IP"));
+
+        let fixed_ip = Config {
+            server_addr: vec![first.clone(), second],
+            ip: Some("10.26.0.2".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(fixed_ip.check().is_ok());
+
+        let duplicate = Config {
+            server_addr: vec![first.clone(), first],
+            ip: Some("10.26.0.2".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(
+            duplicate
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("不能相同")
+        );
+    }
+
+    #[test]
+    fn server_relay_clients_allow_no_device_mode() {
+        let config = Config {
+            server_addr: vec!["quic://127.0.0.1:29872".parse().unwrap()],
+            device_mode: DeviceMode::No,
+            allow_ikev2: true,
+            allow_wireguard: true,
+            ..Default::default()
+        };
+        assert!(config.check().is_ok());
+    }
+
+    #[tokio::test]
+    async fn peer_address_parse_and_display() {
+        let both = " 127.0.0.1:29872 ".parse::<PeerAddress>().unwrap();
+        assert_eq!(both.protocol(), PeerProtocol::Both);
+        assert_eq!(both.to_string(), "127.0.0.1:29872");
+        // IP 字面量在使用时直接构建 endpoint，无需 DNS
+        let endpoints = both.endpoints(&None).await.unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints.iter().any(|(protocol, _)| protocol.is_tcp()));
+        assert!(endpoints.iter().any(|(protocol, _)| protocol.is_udp()));
+
+        let tcp = "TCP://127.0.0.1:29872".parse::<PeerAddress>().unwrap();
+        assert_eq!(tcp.protocol(), PeerProtocol::Tcp);
+        assert_eq!(tcp.to_string(), "tcp://127.0.0.1:29872");
+
+        let udp = "udp://[::1]:29872".parse::<PeerAddress>().unwrap();
+        assert_eq!(udp.protocol(), PeerProtocol::Udp);
+        assert_eq!(udp.to_string(), "udp://[::1]:29872");
+
+        let dynamic = "DYNAMIC://https://Example.com/Peers?token=AbC"
+            .parse::<PeerAddress>()
+            .unwrap();
+        assert!(dynamic.is_dynamic());
+        assert_eq!(dynamic.protocol(), PeerProtocol::Both);
+        assert_eq!(
+            dynamic.to_string(),
+            "dynamic://https://Example.com/Peers?token=AbC"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_peer_address_http_skips_invalid_entries() {
+        let body = "127.0.0.1:30001\ntcp://127.0.0.1:30002\nudp://[::1]:30003\nquic://127.0.0.1:30004\ndynamic://nested.example\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let address = spawn_http_server(response).await;
+        let dynamic: PeerAddress = format!("dynamic://http://{address}/peers").parse().unwrap();
+
+        let peers = dynamic.resolve_dynamic(&None).await.unwrap();
+        assert_eq!(
+            peers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "127.0.0.1:30001",
+                "tcp://127.0.0.1:30002",
+                "udp://[::1]:30003",
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_address_supports_domain_without_resolving() {
+        // 域名只做 host:port 拆分，解析时不做 DNS
+        let domain = "peer.example.com:29872".parse::<PeerAddress>().unwrap();
+        assert_eq!(domain.protocol(), PeerProtocol::Both);
+        assert_eq!(domain.to_string(), "peer.example.com:29872");
+
+        let tcp = "tcp://peer.example.com:29873"
+            .parse::<PeerAddress>()
+            .unwrap();
+        assert_eq!(tcp.to_string(), "tcp://peer.example.com:29873");
+    }
+
+    #[test]
+    fn peer_address_rejects_invalid_values() {
+        for value in [
+            "quic://127.0.0.1:29872",
+            "dynamic://",
+            "127.0.0.1",
+            "example.com",
+            "127.0.0.1:0",
+            "example.com:0",
+        ] {
+            assert!(
+                value.parse::<PeerAddress>().is_err(),
+                "{value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn punch_rule_parses_aliases_and_rejects_invalid_values() {
+        let host = "10.26.0.2,ipv4-udp".parse::<PunchRule>().unwrap();
+        assert_eq!(host.target().prefix_len(), 32);
+        assert!(host.policies().is_match(PunchPolicy::IPv4Udp));
+        assert_eq!(host.to_string(), "10.26.0.2,IPv4Udp");
+
+        let cidr = "10.26.1.0/24,IPv4Tcp,ipv6_udp"
+            .parse::<PunchRule>()
+            .unwrap();
+        assert!(cidr.policies().is_match(PunchPolicy::IPv4Tcp));
+        assert!(cidr.policies().is_match(PunchPolicy::IPv6Udp));
+        assert_eq!(cidr.to_string(), "10.26.1.0/24,IPv4Tcp,IPv6Udp");
+
+        for value in ["10.26.0.2", "10.26.0.2,", "bad,IPv4Udp", "10.26.0.2,quic"] {
+            assert!(value.parse::<PunchRule>().is_err(), "{value} must fail");
+        }
+    }
+
+    #[test]
+    fn punch_rules_merge_and_use_longest_prefix() {
+        let mut config = Config {
+            punch_model: vec![
+                "10.26.0.0/16,IPv4Tcp".parse().unwrap(),
+                "10.26.1.0/24,IPv4Udp".parse().unwrap(),
+                "10.26.1.0/24,IPv6Tcp,IPv4Udp".parse().unwrap(),
+            ],
+            ..Default::default()
+        };
+        config.normalize().unwrap();
+        assert_eq!(config.punch_model.len(), 2);
+
+        let narrow = punch_model_for(&config.punch_model, &Ipv4Addr::new(10, 26, 1, 9));
+        assert!(narrow.is_match(PunchPolicy::IPv4Udp));
+        assert!(narrow.is_match(PunchPolicy::IPv6Tcp));
+        assert!(!narrow.is_match(PunchPolicy::IPv4Tcp));
+
+        let broad = punch_model_for(&config.punch_model, &Ipv4Addr::new(10, 26, 2, 9));
+        assert!(broad.is_match(PunchPolicy::IPv4Tcp));
+        assert!(!broad.is_match(PunchPolicy::IPv4Udp));
+
+        let unmatched = punch_model_for(&config.punch_model, &Ipv4Addr::new(10, 27, 0, 1));
+        for policy in PUNCH_POLICIES {
+            assert!(unmatched.is_match(policy));
+        }
+    }
+
+    #[test]
+    fn turn_rule_parses_ip_and_cidr_and_uses_longest_prefix() {
+        let host = "10.26.1.9,10.26.0.3".parse::<TurnRule>().unwrap();
+        assert_eq!(host.target().prefix_len(), 32);
+        assert_eq!(host.to_string(), "10.26.1.9,10.26.0.3");
+
+        let broad = "10.26.0.0/16,10.26.0.2".parse::<TurnRule>().unwrap();
+        let narrow = "10.26.1.0/24,10.26.0.4".parse::<TurnRule>().unwrap();
+        let rules = vec![narrow, broad];
+        assert_eq!(
+            turn_ip_for(&rules, &Ipv4Addr::new(10, 26, 1, 8)),
+            Some(Ipv4Addr::new(10, 26, 0, 4))
+        );
+        assert_eq!(
+            turn_ip_for(&rules, &Ipv4Addr::new(10, 26, 2, 8)),
+            Some(Ipv4Addr::new(10, 26, 0, 2))
+        );
+        assert_eq!(turn_ip_for(&rules, &Ipv4Addr::new(10, 27, 1, 8)), None);
+    }
+
+    #[test]
+    fn turn_rule_rejects_invalid_values_and_conflicts() {
+        for value in ["10.26.0.0/24", "bad,10.26.0.2", "10.26.0.1,bad"] {
+            assert!(value.parse::<TurnRule>().is_err(), "{value} must fail");
+        }
+
+        let mut config = Config {
+            turn: vec![
+                "10.26.0.0/24,10.26.0.2".parse().unwrap(),
+                "10.26.0.0/24,10.26.0.3".parse().unwrap(),
+            ],
+            ..Default::default()
+        };
+        assert!(config.normalize().is_err());
+
+        config.turn = vec![
+            "10.26.0.0/24,10.26.0.2".parse().unwrap(),
+            "10.26.0.0/24,10.26.0.2".parse().unwrap(),
+        ];
+        config.normalize().unwrap();
+        assert_eq!(config.turn.len(), 1);
+    }
+
+    #[test]
+    fn configured_turn_ip_remains_punchable_inside_target_network() {
+        let rules = vec!["10.26.0.0/16,10.26.0.2".parse().unwrap()];
+        assert!(!allow_punch(&rules, &Ipv4Addr::new(10, 26, 0, 9)));
+        assert!(allow_punch(&rules, &Ipv4Addr::new(10, 26, 0, 2)));
+        assert!(allow_punch(&rules, &Ipv4Addr::new(10, 27, 0, 9)));
+    }
+
+    #[test]
+    fn to_toml_string_emits_non_default_fields_and_identity() {
+        let config = Config {
+            network_code: "net".to_string(),
+            device_id: "dev".to_string(),
+            device_name: "node".to_string(),
+            compress: true,
+            mtu: Some(1380),
+            server_addr: vec!["tcp://127.0.0.1:29872".parse().unwrap()],
+            ..Config::default()
+        };
+        let text = config.to_toml_string();
+        assert!(text.contains("network_code = \"net\""), "{text}");
+        assert!(text.contains("device_id = \"dev\""), "{text}");
+        assert!(text.contains("device_name = \"node\""), "{text}");
+        assert!(
+            text.contains("server = [\"tcp://127.0.0.1:29872\"]"),
+            "{text}"
+        );
+        assert!(text.contains("compress = true"), "{text}");
+        assert!(text.contains("mtu = 1380"), "{text}");
+        // 默认值字段不输出
+        assert!(!text.contains("rtx"), "{text}");
+        assert!(!text.contains("no_punch"), "{text}");
+        assert!(!text.contains("password"), "{text}");
+        // 输出本身是合法 TOML
+        assert!(toml::from_str::<toml::Table>(&text).is_ok(), "{text}");
+    }
+}

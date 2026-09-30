@@ -132,11 +132,23 @@ class DataPersistence {
     return configs.any((config) => config.deviceID.trim().isNotEmpty);
   }
 
+  /// 用新的安装级唯一身份重建配置。
+  ///
+  /// 仅替换「未自定义」的设备ID（为空或仍等于上一个安装级唯一身份 previousUniqueId），
+  /// 用户显式自定义过的设备ID原样保留，避免轮换抹掉用户设置。
   static List<NetworkConfig> rebuildNetworkConfigsWithUniqueId(
     List<NetworkConfig> configs,
-    String nextUniqueId,
-  ) {
+    String nextUniqueId, {
+    String previousUniqueId = '',
+  }) {
+    final previous = previousUniqueId.trim();
     return configs.map((config) {
+      final current = config.deviceID.trim();
+      final isCustom =
+          current.isNotEmpty && previous.isNotEmpty && current != previous;
+      if (isCustom) {
+        return config;
+      }
       config.deviceID = nextUniqueId;
       return config;
     }).toList(growable: false);
@@ -217,11 +229,14 @@ class DataPersistence {
   }) async {
     final configManager = await _getConfigManager();
     final configs = await loadData();
+    final currentUniqueId =
+        configManager.getString(vntUniqueIdKey)?.trim() ?? '';
     final nextUniqueId = const Uuid().v4().toString();
     final nextRegistrationId = const Uuid().v4().toString();
     final rebuiltConfigs = rebuildNetworkConfigsWithUniqueId(
       configs,
       nextUniqueId,
+      previousUniqueId: currentUniqueId,
     );
     await saveData(rebuiltConfigs);
     await configManager.setString(vntUniqueIdKey, nextUniqueId);

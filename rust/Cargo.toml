@@ -16,10 +16,11 @@ thunk-rs = { version = "0.3.3", features = ["win7"] }
 
 serde = { version = "1.0", features = ["derive"] }
 flutter_rust_bridge = "=2.1.0"
-vnt-core = { path = "../vendor/vnt-core-2.0.0" }
+vnt-core = { path = "../vendor/vnt-core-2.0.10" }
 anyhow = "1.0.82"
 tokio = { version = "1.37.0", features = ["full"] }
-rust-p2p-core = "0.4"
+# 与 vendor/vnt-core-2.0.10 依赖的 rustp2p-core 修订保持一致
+rustp2p-core = { git = "https://github.com/rustp2p/rustp2p", rev = "04a3e26ba19d9ed08b5addb74c00a23e7a2b7933" }
 ipnet = "2.11"
 serde_json = "1.0"
 

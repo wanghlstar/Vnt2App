@@ -22,15 +22,23 @@ public class MyTileService extends TileService {
         if (self == null) {
             return;
         }
-        Tile tile = self.getQsTile();
-        // 只更新磁贴显示状态，不触发连接操作
-        if (isActive) {
-            tile.setState(Tile.STATE_ACTIVE);
-        } else {
-            tile.setState(Tile.STATE_INACTIVE);
+        try {
+            Tile tile = self.getQsTile();
+            // 服务未被 SystemUI 绑定时 getQsTile() 返回 null，需判空
+            if (tile == null) {
+                return;
+            }
+            // 只更新磁贴显示状态，不触发连接操作
+            if (isActive) {
+                tile.setState(Tile.STATE_ACTIVE);
+            } else {
+                tile.setState(Tile.STATE_INACTIVE);
+            }
+            tile.setLabel("VNT2");
+            tile.updateTile();
+        } catch (Exception e) {
+            Log.w("Tile", "setState failed", e);
         }
-        tile.setLabel("VNT2");
-        tile.updateTile();
     }
 
     @Override
@@ -42,17 +50,24 @@ public class MyTileService extends TileService {
     @Override
     public void onStartListening() {
         super.onStartListening();
-        FlutterMethodChannel.isRunning(isRunning -> {
-            Tile tile = getQsTile();
-            if (isRunning) {
-                tile.setState(Tile.STATE_ACTIVE);
-            } else {
-                tile.setState(Tile.STATE_INACTIVE);
-            }
-            tile.setLabel("VNT2");
-            tile.updateTile();
-            return null;
-        });
+        try {
+            FlutterMethodChannel.isRunning(isRunning -> {
+                Tile tile = getQsTile();
+                if (tile == null) {
+                    return null;
+                }
+                if (isRunning) {
+                    tile.setState(Tile.STATE_ACTIVE);
+                } else {
+                    tile.setState(Tile.STATE_INACTIVE);
+                }
+                tile.setLabel("VNT2");
+                tile.updateTile();
+                return null;
+            });
+        } catch (Exception e) {
+            Log.w("Tile", "onStartListening failed", e);
+        }
         Log.i("Tile", "onStartListening");
     }
 
@@ -67,7 +82,16 @@ public class MyTileService extends TileService {
     public void onTileRemoved() {
         super.onTileRemoved();
         // 磁贴从快速设置面板中移除时调用
+        self = null;
         Log.i("Tile", "onTileRemoved");
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        // 清理静态引用，避免持有已销毁的 Service 实例
+        self = null;
+        Log.i("Tile", "onDestroy");
     }
 
     @Override
@@ -75,6 +99,10 @@ public class MyTileService extends TileService {
         super.onClick();
         // 当用户点击磁贴时调用
         Tile tile = getQsTile();
+        if (tile == null) {
+            Log.w("Tile", "onClick without tile, ignoring");
+            return;
+        }
         Log.i("Tile", "onClick - 当前状态: " + (tile.getState() == Tile.STATE_INACTIVE ? "INACTIVE" : "ACTIVE"));
         Log.i("Tile", "Flutter 初始化状态: " + FlutterMethodChannel.initialized());
 

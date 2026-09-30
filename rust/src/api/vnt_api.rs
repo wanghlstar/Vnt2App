@@ -7,19 +7,20 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context};
 use flutter_rust_bridge::DartFnFuture;
 use ipnet::Ipv4Net;
-use rust_p2p_core::nat::NatInfo;
+use rustp2p_core::nat::NatInfo;
 use tokio::runtime::{Handle, Runtime};
 use vnt_core::api::VntApi as CoreVntApi;
-use vnt_core::context::config::Config as CoreConfig;
+use vnt_core::context::config::{Config as CoreConfig, DeviceMode, VirtualIp};
 use vnt_core::context::NetworkAddr;
-use vnt_core::core::{NetworkManager, RegisterResponse};
+use vnt_core::core::NetworkManager;
+use vnt_core::log_manager::InstanceLog;
 use vnt_core::nat::NetInput;
 use vnt_core::port_mapping::PortMapping;
 use vnt_core::tls::verifier::CertValidationMode;
 use vnt_core::tunnel_core::server::transport::config::ProtocolAddress;
 use vnt_core::utils::task_control::{TaskGroupGuard, TaskGroupManager};
 
-const CORE_VERSION: &str = "2.0.0";
+const CORE_VERSION: &str = "2.0.10";
 
 #[flutter_rust_bridge::frb]
 pub async fn vnt_init(vnt_config: VntConfig, call: VntApiCallback) -> anyhow::Result<VntApi> {
@@ -114,6 +115,7 @@ pub struct VntApi {
     _task_group_guard: TaskGroupGuard,
     network_manager: Mutex<Option<NetworkManager>>,
     core_api: CoreVntApi,
+    _routes_rx: tokio::sync::watch::Receiver<Vec<NetInput>>,
     stopped: AtomicBool,
 }
 
@@ -131,7 +133,7 @@ impl VntApi {
             });
         }
 
-        let (network_manager, network_addr) =
+        let (network_manager, network_addr, routes_rx) =
             match runtime.block_on(async { start_network(core_config, task_group, &call).await }) {
                 Ok(value) => value,
                 Err(err) => {
@@ -153,6 +155,7 @@ impl VntApi {
             _task_group_guard: task_group_guard,
             network_manager: Mutex::new(Some(network_manager)),
             core_api: api,
+            _routes_rx: routes_rx,
             stopped: AtomicBool::new(false),
         })
     }
@@ -360,32 +363,36 @@ impl VntApi {
 async fn start_network(
     core_config: CoreConfig,
     task_group: vnt_core::utils::task_control::TaskGroup,
-    call: &VntApiCallback,
-) -> anyhow::Result<(NetworkManager, NetworkAddr)> {
-    let input_routes = core_config.input.clone();
-    let mut network_manager = NetworkManager::create_network(Box::new(core_config), task_group)
+    _call: &VntApiCallback,
+) -> anyhow::Result<(
+    NetworkManager,
+    NetworkAddr,
+    tokio::sync::watch::Receiver<Vec<NetInput>>,
+)> {
+    let _input_routes = core_config.input.clone();
+    let device_mode = core_config.device_mode;
+    let instance_log = Arc::new(InstanceLog::new("vnt2-app"));
+    // 运行期子网路由变化通道：由核心在路由快照变化时推送，
+    // 接收端保存在 VntApi 中避免通道被关闭
+    let (routes_tx, routes_rx) = tokio::sync::watch::channel(core_config.input.clone());
+    let mut network_manager = NetworkManager::create_network(
+        Box::new(core_config),
+        task_group,
+        instance_log,
+        routes_tx,
+    )
+    .await
+    .context("创建 VNT 2.0 网络实例失败")?;
+    let network_addr = network_manager
+        .current_network()
         .await
-        .context("创建 VNT 2.0 网络实例失败")?;
-    let register_response = network_manager
-        .register()
-        .await
-        .context("注册到 VNTS 2.0 服务端失败")?;
-    let network_addr = match register_response {
-        RegisterResponse::Success(network_addr) => network_addr,
-        RegisterResponse::Failed(error) => {
-            return Err(anyhow!(
-                "注册到 VNTS 2.0 服务端失败(code={}): {}",
-                error.code,
-                error.message
-            ));
-        }
-    };
-    if !network_manager.is_no_tun() {
+        .map_err(|err| anyhow!("注册到 VNTS 2.0 服务端失败: {err:#}"))?;
+    if device_mode.has_device() {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             let virtual_network = Ipv4Net::new(network_addr.ip, network_addr.prefix_len)
                 .context("解析虚拟网络段失败")?;
-            let external_route = input_routes
+            let external_route = _input_routes
                 .iter()
                 .map(|input| {
                     (
@@ -394,11 +401,14 @@ async fn start_network(
                     )
                 })
                 .collect();
-            let tun_fd = call
+            let tun_fd = _call
                 .generate_tun(RustDeviceConfig {
                     virtual_ip: network_addr.ip.to_string(),
                     virtual_netmask: prefix_to_netmask(network_addr.prefix_len).to_string(),
-                    virtual_gateway: network_addr.gateway.to_string(),
+                    virtual_gateway: network_addr
+                        .gateway
+                        .map(|gateway| gateway.to_string())
+                        .unwrap_or_default(),
                     virtual_network: virtual_network.network().to_string(),
                     external_route,
                 })
@@ -406,28 +416,30 @@ async fn start_network(
             if tun_fd == 0 {
                 return Err(anyhow!("系统 VPN 服务未返回有效 tun fd"));
             }
+            // SAFETY: fd 由 Android VpnService / iOS NEPacketTunnelProvider 建立并交由 Rust 侧持有，
+            // 生命周期内保持有效，最终由 OwnedFd 关闭
+            let tun_fd = unsafe {
+                <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(tun_fd as i32)
+            };
             network_manager
-                .start_tun_fd(Some(tun_fd as i32))
+                .start_device_fd(Some(tun_fd))
                 .await
                 .context("启动虚拟网卡失败")?;
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             network_manager
-                .start_tun()
+                .start_device()
                 .await
                 .context("启动虚拟网卡失败")?;
-            network_manager
-                .set_tun_network_ip(network_addr.ip, network_addr.prefix_len)
-                .await
-                .context("设置虚拟网卡 IP 失败")?;
-            network_manager
-                .add_input_routes()
-                .await
-                .context("添加子网路由失败")?;
         }
+    } else {
+        network_manager
+            .apply_initial_network_info()
+            .await
+            .context("应用网络信息失败")?;
     }
-    Ok((network_manager, network_addr))
+    Ok((network_manager, network_addr, routes_rx))
 }
 
 fn convert_to_core_config(vnt_config: &VntConfig) -> anyhow::Result<(CoreConfig, Vec<String>)> {
@@ -457,9 +469,9 @@ fn convert_to_core_config(vnt_config: &VntConfig) -> anyhow::Result<(CoreConfig,
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let ip = match &vnt_config.ip {
-        Some(ip) if !ip.trim().is_empty() => {
-            Some(Ipv4Addr::from_str(ip.trim()).context("解析指定虚拟 IP 失败")?)
-        }
+        Some(ip) if !ip.trim().is_empty() => Some(
+            VirtualIp::from_str(ip.trim()).map_err(|err| anyhow!("解析指定虚拟 IP 失败: {err}"))?,
+        ),
         _ => None,
     };
 
@@ -470,10 +482,18 @@ fn convert_to_core_config(vnt_config: &VntConfig) -> anyhow::Result<(CoreConfig,
     };
     let udp_stun = normalize_stun_servers(vnt_config.udp_stun.clone(), 3478);
     let tcp_stun = normalize_stun_servers(vnt_config.tcp_stun.clone(), 443);
+    let device_mode = if vnt_config.no_tun {
+        DeviceMode::No
+    } else {
+        DeviceMode::Tun
+    };
 
     Ok((
         CoreConfig {
             server_addr,
+            peer_address: Vec::new(),
+            turn: Vec::new(),
+            punch_model: Vec::new(),
             cert_mode,
             network_code: vnt_config.network_code.trim().to_string(),
             device_id,
@@ -483,6 +503,7 @@ fn convert_to_core_config(vnt_config: &VntConfig) -> anyhow::Result<(CoreConfig,
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            outbound_interface: None,
             ip,
             password: vnt_config
                 .password
@@ -490,13 +511,18 @@ fn convert_to_core_config(vnt_config: &VntConfig) -> anyhow::Result<(CoreConfig,
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             no_punch: vnt_config.no_punch,
+            no_broadcast: false,
+            allow_ikev2: false,
+            allow_wireguard: false,
             compress: vnt_config.compress,
             rtx: vnt_config.rtx,
             fec: vnt_config.fec,
             input,
+            subnet_mapping: Vec::new(),
             output,
+            auto_sync_subnet: false,
             no_nat: vnt_config.no_nat,
-            no_tun: vnt_config.no_tun,
+            device_mode,
             mtu: vnt_config
                 .mtu
                 .map(|value| value.min(u16::MAX as u32) as u16),
@@ -504,7 +530,10 @@ fn convert_to_core_config(vnt_config: &VntConfig) -> anyhow::Result<(CoreConfig,
             allow_port_mapping: vnt_config.allow_port_mapping,
             udp_stun,
             tcp_stun,
+            tunnel_addr: Vec::new(),
             tunnel_port: vnt_config.tunnel_port,
+            event_script: None,
+            managed: None,
         },
         connect_targets,
     ))
@@ -581,7 +610,10 @@ fn current_device_from_api(api: &CoreVntApi) -> RustCurrentDeviceInfo {
     RustCurrentDeviceInfo {
         virtual_ip: network.ip.to_string(),
         virtual_netmask: prefix_to_netmask(network.prefix_len).to_string(),
-        virtual_gateway: network.gateway.to_string(),
+        virtual_gateway: network
+            .gateway
+            .map(|gateway| gateway.to_string())
+            .unwrap_or_default(),
         virtual_network: network_net.network().to_string(),
         broadcast_ip: network.broadcast.to_string(),
         connect_server,
@@ -598,7 +630,7 @@ macro_rules! rust_route_from_core_route {
             } else {
                 "ClientRelay".to_string()
             },
-            addr: $route.route_key().addr().to_string(),
+            addr: $route.route_key().peer_addr().to_string(),
             metric,
             rt: i64::from($route.rtt()),
         }
@@ -606,7 +638,7 @@ macro_rules! rust_route_from_core_route {
 }
 
 fn build_route_from_api(api: &CoreVntApi, ip: Ipv4Addr) -> Option<RustRoute> {
-    if api.network().map(|network| network.gateway) == Some(ip) {
+    if api.network().and_then(|network| network.gateway) == Some(ip) {
         return build_server_route_from_api(api);
     }
 
@@ -959,7 +991,10 @@ impl RustRegisterInfo {
         Self {
             virtual_ip: value.ip.to_string(),
             virtual_netmask: prefix_to_netmask(value.prefix_len).to_string(),
-            virtual_gateway: value.gateway.to_string(),
+            virtual_gateway: value
+                .gateway
+                .map(|gateway| gateway.to_string())
+                .unwrap_or_default(),
         }
     }
 }
