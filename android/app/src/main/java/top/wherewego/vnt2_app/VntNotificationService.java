@@ -35,6 +35,7 @@ public class VntNotificationService extends Service {
     // 通知动作
     private static final String ACTION_TOGGLE = "top.wherewego.vnt2_app.NOTIFICATION_TOGGLE";
     private static final String ACTION_UPDATE = "top.wherewego.vnt2_app.NOTIFICATION_UPDATE";
+    private static final String ACTION_DISMISS = "top.wherewego.vnt2_app.NOTIFICATION_DISMISS";
 
     // SharedPreferences 相关
     private static final String PREFS_NAME = "FlutterSharedPreferences";
@@ -74,6 +75,11 @@ public class VntNotificationService extends Service {
             Notification notification = buildNotification();
             if (notification != null) {
                 startForeground(NOTIFICATION_ID, notification);
+                if (!isConnected) {
+                    // 未连接时解除前台状态：通知降级为普通通知，可以划掉
+                    detachForeground();
+                    Log.i(TAG, "未连接状态，通知已设为可划掉");
+                }
                 Log.i(TAG, "前台服务启动成功");
             } else {
                 Log.e(TAG, "通知创建失败，无法启动前台服务");
@@ -98,6 +104,18 @@ public class VntNotificationService extends Service {
             return START_STICKY;
         }
 
+        // 用户划掉了未连接状态的通知：移除通知并停止服务，不再重新弹出
+        if (intent != null && ACTION_DISMISS.equals(intent.getAction())) {
+            Log.i(TAG, "通知被划掉，停止通知服务");
+            isConnected = false;
+            detachForeground();
+            if (notificationManager != null) {
+                notificationManager.cancel(NOTIFICATION_ID);
+            }
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
         // 如果 Flutter 已初始化，获取当前连接状态
         if (FlutterMethodChannel.initialized()) {
             updateNotificationFromFlutter();
@@ -111,8 +129,25 @@ public class VntNotificationService extends Service {
         super.onDestroy();
         Log.i(TAG, "VntNotificationService 销毁");
 
+        // 未连接时通知已降级为普通通知，服务销毁后手动清理，避免残留
+        if (!isConnected && notificationManager != null) {
+            notificationManager.cancel(NOTIFICATION_ID);
+        }
+
         // 清除静态实例
         instance = null;
+    }
+
+    /**
+     * 解除前台服务状态但保留通知：通知从"不可划掉"变为普通通知。
+     * 连接中不调用此方法，保持常驻。
+     */
+    private void detachForeground() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(Service.STOP_FOREGROUND_DETACH);
+        } else {
+            stopForeground(false);
+        }
     }
 
     @Nullable
@@ -173,6 +208,16 @@ public class VntNotificationService extends Service {
                 pendingIntentFlags
             );
 
+            // 划掉通知时的回调：未连接状态允许划掉，划掉后停止服务
+            Intent dismissIntent = new Intent(this, VntNotificationService.class);
+            dismissIntent.setAction(ACTION_DISMISS);
+            PendingIntent dismissPendingIntent = PendingIntent.getService(
+                this,
+                2,  // requestCode=2 用于划掉通知，避免与其他 PendingIntent 冲突
+                dismissIntent,
+                pendingIntentFlags
+            );
+
             Log.d(TAG, "创建 PendingIntent: 使用 getService() 方式，action=" + ACTION_TOGGLE);
 
             // 状态文本
@@ -209,7 +254,8 @@ public class VntNotificationService extends Service {
                     .setContentIntent(contentIntent)
                     .setCustomContentView(notificationLayout) // 使用自定义布局
                     .setStyle(new NotificationCompat.DecoratedCustomViewStyle()) // 使用装饰样式
-                    .setOngoing(true) // 设置为常驻通知，不可滑动删除
+                    .setOngoing(isConnected) // 仅已连接时常驻不可划掉，未连接可划掉
+                    .setDeleteIntent(dismissPendingIntent) // 划掉后停止服务，避免再次弹出
                     .setPriority(NotificationCompat.PRIORITY_LOW) // 低优先级
                     .setShowWhen(false) // 不显示时间
                     .setAutoCancel(false); // 点击后不自动取消
@@ -234,7 +280,8 @@ public class VntNotificationService extends Service {
                     .setContentTitle("VNT2 - " + statusText)
                     .setContentText(description)
                     .setContentIntent(contentIntent)
-                    .setOngoing(true)
+                    .setOngoing(isConnected) // 仅已连接时常驻不可划掉，未连接可划掉
+                    .setDeleteIntent(dismissPendingIntent) // 划掉后停止服务，避免再次弹出
                     .setPriority(NotificationCompat.PRIORITY_LOW)
                     .setShowWhen(false)
                     .setAutoCancel(false);
@@ -260,17 +307,30 @@ public class VntNotificationService extends Service {
     }
 
     /**
-     * 更新通知
+     * 更新通知：已连接时重新进入前台常驻，未连接时降级为可划掉的普通通知
      */
     private void updateNotification() {
         try {
             Notification notification = buildNotification();
-            if (notification != null) {
-                notificationManager.notify(NOTIFICATION_ID, notification);
-                Log.i(TAG, "通知已更新: isConnected=" + isConnected + ", configName=" + configName);
-            } else {
+            if (notification == null) {
                 Log.e(TAG, "通知创建失败，无法更新");
+                return;
             }
+            if (isConnected) {
+                try {
+                    startForeground(NOTIFICATION_ID, notification);
+                } catch (Exception e) {
+                    // Android 12+ 后台状态下调回前台可能被系统拒绝，
+                    // 降级为普通通知（VPN 连接本身不受影响）
+                    Log.w(TAG, "startForeground 失败，降级为普通通知: " + e.getMessage());
+                    detachForeground();
+                    notificationManager.notify(NOTIFICATION_ID, notification);
+                }
+            } else {
+                detachForeground();
+                notificationManager.notify(NOTIFICATION_ID, notification);
+            }
+            Log.i(TAG, "通知已更新: isConnected=" + isConnected + ", configName=" + configName);
         } catch (Exception e) {
             Log.e(TAG, "更新通知失败: " + e.getMessage(), e);
         }
