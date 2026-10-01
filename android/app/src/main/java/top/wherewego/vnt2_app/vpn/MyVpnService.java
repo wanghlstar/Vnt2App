@@ -33,6 +33,8 @@ public class MyVpnService extends VpnService {
         // 冷启动进程内 pendingConfig 也为 null，此时直接退出，避免 NPE 崩溃
         if (intent == null || pendingConfig == null) {
             Log.w(TAG, "onStartCommand without valid config, stopping service");
+            // 通知 Dart 侧失败，避免 invokeMethod 的 Future 永远悬挂
+            FlutterMethodChannel.callError("VPN 服务启动失败：缺少设备配置", null);
             stopSelf();
             return START_NOT_STICKY;
         }

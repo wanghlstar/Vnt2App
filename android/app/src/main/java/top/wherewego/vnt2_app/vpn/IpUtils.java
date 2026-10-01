@@ -20,11 +20,26 @@ public class IpUtils {
                 (ipAddress & 0x000000FF);
     }
     public static int ipToInt(String ipAddress) {
+        if (ipAddress == null || ipAddress.trim().isEmpty()) {
+            // 空值（如核心未下发网关）不能抛异常，否则整个建连流程会被打断
+            return 0;
+        }
         String[] parts = ipAddress.split("\\.");
+        if (parts.length != 4) {
+            return 0;
+        }
         int ip = 0;
         for (int i = 0; i < 4; i++) {
             ip <<= 8;
-            ip |= Integer.parseInt(parts[i]);
+            try {
+                int part = Integer.parseInt(parts[i]);
+                if (part < 0 || part > 255) {
+                    return 0;
+                }
+                ip |= part;
+            } catch (NumberFormatException e) {
+                return 0;
+            }
         }
         return ip;
     }

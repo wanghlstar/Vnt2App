@@ -401,14 +401,14 @@ async fn start_network(
                     )
                 })
                 .collect();
+            // 固定 IP 模式下服务端不下发网关，取网段第一个可用地址兜底；
+            // 绝不能传空串（Android VpnService/config 解析会因空 IP 抛异常）
+            let virtual_gateway = network_gateway_string(&network_addr);
             let tun_fd = _call
                 .generate_tun(RustDeviceConfig {
                     virtual_ip: network_addr.ip.to_string(),
                     virtual_netmask: prefix_to_netmask(network_addr.prefix_len).to_string(),
-                    virtual_gateway: network_addr
-                        .gateway
-                        .map(|gateway| gateway.to_string())
-                        .unwrap_or_default(),
+                    virtual_gateway,
                     virtual_network: virtual_network.network().to_string(),
                     external_route,
                 })
@@ -610,10 +610,7 @@ fn current_device_from_api(api: &CoreVntApi) -> RustCurrentDeviceInfo {
     RustCurrentDeviceInfo {
         virtual_ip: network.ip.to_string(),
         virtual_netmask: prefix_to_netmask(network.prefix_len).to_string(),
-        virtual_gateway: network
-            .gateway
-            .map(|gateway| gateway.to_string())
-            .unwrap_or_default(),
+        virtual_gateway: network_gateway_string(&network),
         virtual_network: network_net.network().to_string(),
         broadcast_ip: network.broadcast.to_string(),
         connect_server,
@@ -746,6 +743,18 @@ fn build_server_relay_route_from_api(api: &CoreVntApi, ip: Ipv4Addr) -> Option<R
         metric: 2,
         rt: i64::from(server_node.rtt.unwrap_or(0).saturating_mul(2)),
     })
+}
+
+/// 网络网关地址字符串：服务端未下发网关时（固定 IP 模式）取网段第一个
+/// 可用地址兜底，保证对外（Dart/Java VpnService）永远不会拿到空串
+fn network_gateway_string(network: &NetworkAddr) -> String {
+    match network.gateway {
+        Some(gateway) => gateway.to_string(),
+        None => Ipv4Net::new(network.ip, network.prefix_len)
+            .ok()
+            .map(|net| Ipv4Addr::from(u32::from(net.network()).saturating_add(1)).to_string())
+            .unwrap_or_else(|| network.ip.to_string()),
+    }
 }
 
 fn prefix_to_netmask(prefix_len: u8) -> Ipv4Addr {
@@ -991,10 +1000,7 @@ impl RustRegisterInfo {
         Self {
             virtual_ip: value.ip.to_string(),
             virtual_netmask: prefix_to_netmask(value.prefix_len).to_string(),
-            virtual_gateway: value
-                .gateway
-                .map(|gateway| gateway.to_string())
-                .unwrap_or_default(),
+            virtual_gateway: network_gateway_string(value),
         }
     }
 }
