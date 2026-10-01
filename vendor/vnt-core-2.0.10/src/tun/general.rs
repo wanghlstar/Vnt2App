@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tun_rs::AsyncDevice;
 use tun_rs::async_framed::{Decoder, DeviceFramedRead, DeviceFramedWrite, Encoder};
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
 use tun_rs::{DeviceBuilder, Layer};
 
 #[derive(Clone)]
@@ -174,7 +174,7 @@ impl DeviceIOManager {
         Ok(())
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
     pub async fn device_if_index(&self) -> anyhow::Result<u32> {
         let guard = self.device.lock().await;
         if let Some(task) = guard
@@ -203,10 +203,15 @@ impl DeviceIOManager {
         {
             return Ok(());
         }
-        // 虚拟网关（服务端下发的 10.26.x.1）是协议层概念，不设置到网卡
+        // 虚拟网关（服务端下发的 10.26.x.1）是协议层概念，不设置到网卡。
+        // iOS/tvOS 上 tun-rs 不支持 set_network_address，虚拟地址由宿主
+        // VpnService/NEPacketTunnelProvider 在建立 tun 时写入
+        #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
         if let Err(error) = task.device.set_network_address(ip, prefix_len, None) {
             return Err(error).context("设置IP失败");
         }
+        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+        let _ = &task;
         guard.network = Some((ip, prefix_len));
         Ok(())
     }
@@ -391,16 +396,19 @@ impl DeviceTask {
 fn create_device(config: DeviceConfig) -> anyhow::Result<AsyncDevice> {
     #[cfg(unix)]
     use std::os::fd::IntoRawFd;
-    #[cfg(target_os = "android")]
+    // 移动平台（Android/iOS/tvOS）没有创建 tun 设备的权限，必须使用宿主
+    // （VpnService / NEPacketTunnelProvider）提供的 tun fd
+    #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
     {
         let fd = config
             .tun_fd
-            .context("Android requires a VpnService TUN fd")?;
+            .context("Android/iOS requires a host-provided TUN fd")?;
         // SAFETY: The fd comes directly from ParcelFileDescriptor returned by
-        // VpnService.Builder.establish and remains open for the network lifetime.
+        // VpnService.Builder.establish (Android) or NEPacketTunnelProvider
+        // (iOS) and remains open for the network lifetime.
         return unsafe { Ok(AsyncDevice::from_fd(fd.into_raw_fd())?) };
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))]
     {
         #[cfg(unix)]
         if let Some(fd) = config.tun_fd {
@@ -456,7 +464,10 @@ fn create_device(config: DeviceConfig) -> anyhow::Result<AsyncDevice> {
     }
 }
 
-#[cfg_attr(target_os = "android", allow(dead_code))]
+#[cfg_attr(
+    any(target_os = "android", target_os = "ios", target_os = "tvos"),
+    allow(dead_code)
+)]
 fn device_creation_error_context(mode: DeviceMode, error: &io::Error) -> &'static str {
     let permission_denied = error.kind() == io::ErrorKind::PermissionDenied || {
         #[cfg(windows)]

@@ -51,11 +51,9 @@ jobs:
             OS: macos-latest
             flutter-version: 3.24.5
 
-          # iOS 构建暂禁用：Xcode 16.2 与旧插件（file_picker 等）存在兼容问题，
-          # 与本次核心升级无关。修复后可取消注释恢复。
-          #- NAME: vnt2App-IOS
-          #  OS: macos-14
-          #  flutter-version: 3.24.5
+          - NAME: vnt2App-IOS
+            OS: macos-14
+            flutter-version: 3.24.5
 
           - NAME: vnt2App-linux-x86_64
             OS: ubuntu-latest
