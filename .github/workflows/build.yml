@@ -478,7 +478,14 @@ jobs:
           cd ..
 
           echo "3. 开始构建"
-          flutter build ios --release --no-codesign -v
+          # 完整日志落盘，失败时打印 error 行并上传 artifact，便于定位
+          if ! flutter build ios --release --no-codesign -v > ios_build.log 2>&1; then
+            echo "======== flutter ios 构建失败，error 行如下 ========"
+            grep -n -iE "(^| )error[: ]|error:|\*\* BUILD FAILED \*\*|Command .* failed" ios_build.log | tail -n 60 || true
+            echo "======== 日志末尾 200 行 ========"
+            tail -n 200 ios_build.log
+            exit 1
+          fi
           
           echo "4. 创建 Payload 目录（IPA 必须结构）"
           cd build/ios/iphoneos
@@ -487,9 +494,17 @@ jobs:
           mv Runner.app Payload/
           
           echo "5. 打包成 IPA"
-          zip -r vnt2_app.ipa Payload
+          zip -r vnt2_app.ipa Payload/
           
           echo "完成：IPA 已生成"
+
+      - name: 上传 iOS 构建日志
+        if: matrix.NAME == 'vnt2App-IOS'
+        uses: actions/upload-artifact@main
+        with:
+          name: ios-build-log
+          path: ios_build.log
+          if-no-files-found: ignore
 
       - name: 设置 QEMU（Linux arm64 跨架构）
         if: startsWith(matrix.NAME, 'vnt2App-linux')
