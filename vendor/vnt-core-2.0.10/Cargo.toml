@@ -59,8 +59,12 @@ toml = "0.9"
 base64 = "0.22"
 rcgen = "0.14.6"
 
+# route_manager 与 machine-uid 均只支持桌面平台；
+# machine-uid 在 iOS/tvOS 上无对应实现会编译失败，移动端走 device_id 文件兜底
+# （与 src/utils/device_id.rs 的 cfg 保持一致）
 [target.'cfg(not(any(target_os = "android", target_os = "ios", target_os = "tvos")))'.dependencies]
 route_manager = "0.2"
+machine-uid = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3.9", features = ["winreg"] }
@@ -69,9 +73,6 @@ windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[target.'cfg(not(target_os = "android"))'.dependencies]
-machine-uid = "0.6"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # reqwest's platform verifier needs an Android Context and companion JVM classes.
